@@ -38,6 +38,22 @@ impl Default for JIT {
 }
 
 impl JIT {
+    pub fn new<It, K>(symbols: It) -> Self
+        where
+            It: IntoIterator<Item = (K, *const u8)>,
+            K: Into<String>,
+    {
+        let mut builder = JITBuilder::new(cranelift_module::default_libcall_names());
+        builder.symbols(symbols);
+        let module = JITModule::new(builder);
+        Self {
+            builder_context: FunctionBuilderContext::new(),
+            ctx: module.make_context(),
+            data_ctx: DataContext::new(),
+            module,
+        }
+    }
+
     /// Compile a string in the toy language into machine code.
     pub fn compile(&mut self, input: &str) -> Result<*const u8, String> {
         // First, parse the string, producing AST nodes.
@@ -109,21 +125,34 @@ impl JIT {
     // Translate from toy-language AST nodes into Cranelift IR.
     fn translate(
         &mut self,
-        params: Vec<String>,
-        the_return: String,
-        stmts: Vec<Expr>,
+        params: Vec<NameType>,
+        the_return: Option<NameType>,
+        stmts: Vec<Stmt>,
     ) -> Result<(), String> {
         // Our toy language currently only supports I64 values, though Cranelift
         // supports other types.
         let int = self.module.target_config().pointer_type();
 
-        for _p in &params {
-            self.ctx.func.signature.params.push(AbiParam::new(int));
+        let mut type_table: HashMap<Typ, types::Type> = HashMap::new();
+        type_table.insert(Typ::Ptr, self.module.target_config().pointer_type());
+        type_table.insert(Typ::I64, types::I64);
+
+        for nt in &params {
+            let p = type_table.get(&nt.typ).expect("Unsupported type in func parameter");
+            self.ctx.func.signature.params.push(AbiParam::new(*p));
         }
+
+        let mut void_return: bool = false;
 
         // Our toy language currently only supports one return value, though
         // Cranelift is designed to support more.
-        self.ctx.func.signature.returns.push(AbiParam::new(int));
+        match the_return {
+            None => void_return = true,
+            Some(NameType { ref typ, .. }) => {
+                let p = type_table.get(typ).expect("Unsupported type");
+                self.ctx.func.signature.returns.push(AbiParam::new(*p));
+            }
+        }
 
         // Create the builder to build a function.
         let mut builder = FunctionBuilder::new(&mut self.ctx.func, &mut self.builder_context);
@@ -133,22 +162,19 @@ impl JIT {
 
         // Since this is the entry block, add block parameters corresponding to
         // the function's parameters.
-        //
-        // TODO: Streamline the API here.
         builder.append_block_params_for_function_params(entry_block);
 
         // Tell the builder to emit code in this block.
         builder.switch_to_block(entry_block);
 
+        // Walk the AST and declare all implicitly-declared variables.
+        let variables =
+            declare_variables(&type_table, &mut builder, &params, &the_return, &stmts, entry_block);
+
         // And, tell the builder that this block will have no further
         // predecessors. Since it's the entry block, it won't have any
         // predecessors.
         builder.seal_block(entry_block);
-
-        // The toy language allows variables to be declared implicitly.
-        // Walk the AST and declare all implicitly-declared variables.
-        let variables =
-            declare_variables(int, &mut builder, &params, &the_return, &stmts, entry_block);
 
         // Now translate the statements of the function body.
         let mut trans = FunctionTranslator {
@@ -157,18 +183,22 @@ impl JIT {
             variables,
             module: &mut self.module,
         };
-        for expr in stmts {
-            trans.translate_expr(expr);
+        for stmt in stmts {
+            trans.translate_stmt(stmt);
         }
 
-        // Set up the return variable of the function. Above, we declared a
-        // variable to hold the return value. Here, we just do a use of that
-        // variable.
-        let return_variable = trans.variables.get(&the_return).unwrap();
-        let return_value = trans.builder.use_var(*return_variable);
+        if !void_return {
+            // Set up the return variable of the function. Above, we declared a
+            // variable to hold the return value. Here, we just do a use of that
+            // variable.
+            let return_variable = trans.variables.get(&the_return.as_ref().unwrap().name).unwrap();
+            let return_value = trans.builder.use_var(*return_variable);
 
-        // Emit the return instruction.
-        trans.builder.ins().return_(&[return_value]);
+            // Emit the return instruction.
+            trans.builder.ins().return_(&[return_value]);
+        } else {
+            trans.builder.ins().return_(&[]);
+        }
 
         // Tell the builder we're done with this function.
         trans.builder.finalize();
@@ -186,6 +216,28 @@ struct FunctionTranslator<'a> {
 }
 
 impl<'a> FunctionTranslator<'a> {
+
+    fn translate_stmt(&mut self, stmt: Stmt) {
+        match stmt {
+            Stmt::IfElse(condition, then_body, else_body) => {
+                self.translate_if_else(*condition, then_body, else_body)
+            }
+            Stmt::WhileLoop(condition, loop_body) => {
+                self.translate_while_loop(*condition, loop_body)
+            }
+            Stmt::Assign(name, expr) => {
+                self.translate_assign(name, *expr)
+            }
+            Stmt::Initialization(nt, expr) => {
+                self.translate_assign(nt.name, *expr)
+            }
+            Stmt::SideEffect(expr) => {
+                self.translate_expr(*expr);
+            }
+            Stmt::Declare(_) => {}
+        }
+    }
+
     /// When you write out instructions in Cranelift, you get back `Value`s. You
     /// can then use these references in other instructions.
     fn translate_expr(&mut self, expr: Expr) -> Value {
@@ -194,6 +246,19 @@ impl<'a> FunctionTranslator<'a> {
                 let imm: i32 = literal.parse().unwrap();
                 self.builder.ins().iconst(self.int, i64::from(imm))
             }
+
+            Expr::Identifier(name) => {
+                // `use_var` is used to read the value of a variable.
+                let variable = self.variables.get(&name).expect("variable not defined");
+                self.builder.use_var(*variable)
+            }
+
+            Expr::Eq(lhs, rhs) => self.translate_icmp(IntCC::Equal, *lhs, *rhs),
+            Expr::Ne(lhs, rhs) => self.translate_icmp(IntCC::NotEqual, *lhs, *rhs),
+            Expr::Lt(lhs, rhs) => self.translate_icmp(IntCC::SignedLessThan, *lhs, *rhs),
+            Expr::Le(lhs, rhs) => self.translate_icmp(IntCC::SignedLessThanOrEqual, *lhs, *rhs),
+            Expr::Gt(lhs, rhs) => self.translate_icmp(IntCC::SignedGreaterThan, *lhs, *rhs),
+            Expr::Ge(lhs, rhs) => self.translate_icmp(IntCC::SignedGreaterThanOrEqual, *lhs, *rhs),
 
             Expr::Add(lhs, rhs) => {
                 let lhs = self.translate_expr(*lhs);
@@ -219,37 +284,18 @@ impl<'a> FunctionTranslator<'a> {
                 self.builder.ins().udiv(lhs, rhs)
             }
 
-            Expr::Eq(lhs, rhs) => self.translate_icmp(IntCC::Equal, *lhs, *rhs),
-            Expr::Ne(lhs, rhs) => self.translate_icmp(IntCC::NotEqual, *lhs, *rhs),
-            Expr::Lt(lhs, rhs) => self.translate_icmp(IntCC::SignedLessThan, *lhs, *rhs),
-            Expr::Le(lhs, rhs) => self.translate_icmp(IntCC::SignedLessThanOrEqual, *lhs, *rhs),
-            Expr::Gt(lhs, rhs) => self.translate_icmp(IntCC::SignedGreaterThan, *lhs, *rhs),
-            Expr::Ge(lhs, rhs) => self.translate_icmp(IntCC::SignedGreaterThanOrEqual, *lhs, *rhs),
             Expr::Call(name, args) => self.translate_call(name, args),
             Expr::GlobalDataAddr(name) => self.translate_global_data_addr(name),
-            Expr::Identifier(name) => {
-                // `use_var` is used to read the value of a variable.
-                let variable = self.variables.get(&name).expect("variable not defined");
-                self.builder.use_var(*variable)
-            }
-            Expr::Assign(name, expr) => self.translate_assign(name, *expr),
-            Expr::IfElse(condition, then_body, else_body) => {
-                self.translate_if_else(*condition, then_body, else_body)
-            }
-            Expr::WhileLoop(condition, loop_body) => {
-                self.translate_while_loop(*condition, loop_body)
-            }
         }
     }
 
-    fn translate_assign(&mut self, name: String, expr: Expr) -> Value {
+    fn translate_assign(&mut self, name: String, expr: Expr) {
         // `def_var` is used to write the value of a variable. Note that
         // variables can have multiple definitions. Cranelift will
         // convert them into SSA form for itself automatically.
         let new_value = self.translate_expr(expr);
-        let variable = self.variables.get(&name).unwrap();
+        let variable = self.variables.get(&*name).unwrap();
         self.builder.def_var(*variable, new_value);
-        new_value
     }
 
     fn translate_icmp(&mut self, cmp: IntCC, lhs: Expr, rhs: Expr) -> Value {
@@ -262,9 +308,9 @@ impl<'a> FunctionTranslator<'a> {
     fn translate_if_else(
         &mut self,
         condition: Expr,
-        then_body: Vec<Expr>,
-        else_body: Vec<Expr>,
-    ) -> Value {
+        then_body: Vec<Stmt>,
+        else_body: Vec<Stmt>,
+    ) {
         let condition_value = self.translate_expr(condition);
 
         let then_block = self.builder.create_block();
@@ -285,23 +331,21 @@ impl<'a> FunctionTranslator<'a> {
 
         self.builder.switch_to_block(then_block);
         self.builder.seal_block(then_block);
-        let mut then_return = self.builder.ins().iconst(self.int, 0);
-        for expr in then_body {
-            then_return = self.translate_expr(expr);
+        for stmt in then_body {
+            self.translate_stmt(stmt);
         }
 
         // Jump to the merge block, passing it the block return value.
-        self.builder.ins().jump(merge_block, &[then_return]);
+        self.builder.ins().jump(merge_block, &[]);
 
         self.builder.switch_to_block(else_block);
         self.builder.seal_block(else_block);
-        let mut else_return = self.builder.ins().iconst(self.int, 0);
-        for expr in else_body {
-            else_return = self.translate_expr(expr);
+        for stmt in else_body {
+            self.translate_stmt(stmt);
         }
 
         // Jump to the merge block, passing it the block return value.
-        self.builder.ins().jump(merge_block, &[else_return]);
+        self.builder.ins().jump(merge_block, &[]);
 
         // Switch to the merge block for subsequent statements.
         self.builder.switch_to_block(merge_block);
@@ -311,12 +355,10 @@ impl<'a> FunctionTranslator<'a> {
 
         // Read the value of the if-else by reading the merge block
         // parameter.
-        let phi = self.builder.block_params(merge_block)[0];
-
-        phi
+        self.builder.block_params(merge_block)[0];
     }
 
-    fn translate_while_loop(&mut self, condition: Expr, loop_body: Vec<Expr>) -> Value {
+    fn translate_while_loop(&mut self, condition: Expr, loop_body: Vec<Stmt>) {
         let header_block = self.builder.create_block();
         let body_block = self.builder.create_block();
         let exit_block = self.builder.create_block();
@@ -331,8 +373,8 @@ impl<'a> FunctionTranslator<'a> {
         self.builder.switch_to_block(body_block);
         self.builder.seal_block(body_block);
 
-        for expr in loop_body {
-            self.translate_expr(expr);
+        for stmt in loop_body {
+            self.translate_stmt(stmt);
         }
         self.builder.ins().jump(header_block, &[]);
 
@@ -342,9 +384,6 @@ impl<'a> FunctionTranslator<'a> {
         // more backedges to the header to exits to the bottom.
         self.builder.seal_block(header_block);
         self.builder.seal_block(exit_block);
-
-        // Just return 0 for now.
-        self.builder.ins().iconst(self.int, 0)
     }
 
     fn translate_call(&mut self, name: String, args: Vec<Expr>) -> Value {
@@ -390,28 +429,34 @@ impl<'a> FunctionTranslator<'a> {
 }
 
 fn declare_variables(
-    int: types::Type,
+    type_table: &HashMap<Typ, types::Type>,
     builder: &mut FunctionBuilder,
-    params: &[String],
-    the_return: &str,
-    stmts: &[Expr],
+    params: &[NameType],
+    the_return: &Option<NameType>,
+    stmts: &[Stmt],
     entry_block: Block,
 ) -> HashMap<String, Variable> {
     let mut variables = HashMap::new();
     let mut index = 0;
 
     for (i, name) in params.iter().enumerate() {
-        // TODO: cranelift_frontend should really have an API to make it easy to set
-        // up param variables.
         let val = builder.block_params(entry_block)[i];
-        let var = declare_variable(int, builder, &mut variables, &mut index, name);
+        let var = declare_variable(type_table, builder, &mut variables, &mut index, name);
         builder.def_var(var, val);
     }
-    let zero = builder.ins().iconst(int, 0);
-    let return_variable = declare_variable(int, builder, &mut variables, &mut index, the_return);
-    builder.def_var(return_variable, zero);
-    for expr in stmts {
-        declare_variables_in_stmt(int, builder, &mut variables, &mut index, expr);
+
+    match the_return {
+        None => {}
+        Some(the_return) => {
+            let int = type_table.get(&Typ::I64).unwrap();
+            let zero = builder.ins().iconst(*int, 0);
+            let return_variable = declare_variable(type_table, builder, &mut variables, &mut index, the_return);
+            builder.def_var(return_variable, zero);
+        }
+    }
+
+    for stmt in stmts {
+        declare_variables_in_stmt(type_table, builder, &mut variables, &mut index, stmt);
     }
 
     variables
@@ -420,28 +465,31 @@ fn declare_variables(
 /// Recursively descend through the AST, translating all implicit
 /// variable declarations.
 fn declare_variables_in_stmt(
-    int: types::Type,
+    type_table: &HashMap<Typ, types::Type>,
     builder: &mut FunctionBuilder,
     variables: &mut HashMap<String, Variable>,
     index: &mut usize,
-    expr: &Expr,
+    stmt: &Stmt,
 ) {
-    match *expr {
-        Expr::Assign(ref name, _) => {
-            declare_variable(int, builder, variables, index, name);
-        }
-        Expr::IfElse(ref _condition, ref then_body, ref else_body) => {
+    match *stmt {
+        Stmt::IfElse(_, ref then_body, ref else_body) => {
             for stmt in then_body {
-                declare_variables_in_stmt(int, builder, variables, index, stmt);
+                declare_variables_in_stmt(type_table, builder, variables, index, stmt);
             }
             for stmt in else_body {
-                declare_variables_in_stmt(int, builder, variables, index, stmt);
+                declare_variables_in_stmt(type_table, builder, variables, index, stmt);
             }
         }
-        Expr::WhileLoop(ref _condition, ref loop_body) => {
+        Stmt::WhileLoop(_, ref loop_body) => {
             for stmt in loop_body {
-                declare_variables_in_stmt(int, builder, variables, index, stmt);
+                declare_variables_in_stmt(type_table, builder, variables, index, stmt);
             }
+        }
+        Stmt::Declare(ref nt) => {
+            declare_variable(type_table, builder, variables, index, &nt);
+        }
+        Stmt::Initialization(ref nt, _) => {
+            declare_variable(type_table, builder, variables, index, &nt);
         }
         _ => (),
     }
@@ -449,16 +497,18 @@ fn declare_variables_in_stmt(
 
 /// Declare a single variable declaration.
 fn declare_variable(
-    int: types::Type,
+    type_table: &HashMap<Typ, types::Type>,
     builder: &mut FunctionBuilder,
     variables: &mut HashMap<String, Variable>,
     index: &mut usize,
-    name: &str,
+    nt: &NameType,
 ) -> Variable {
     let var = Variable::new(*index);
+    let NameType { name, typ } = nt;
+    let tp = type_table.get(&typ).expect(&*format!("unexpected type for {}", name));
     if !variables.contains_key(name) {
         variables.insert(name.into(), var);
-        builder.declare_var(var, int);
+        builder.declare_var(var, *tp);
         *index += 1;
     }
     var
