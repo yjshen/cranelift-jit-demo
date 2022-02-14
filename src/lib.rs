@@ -1,5 +1,9 @@
+extern crate core;
+
 pub mod frontend;
 pub mod jit;
+mod assembler;
+mod error;
 
 #[cfg(test)]
 mod tests {
@@ -41,20 +45,18 @@ mod tests {
 
         let mut jit = JIT::new(symbols);
 
-        let err = run_foo(&mut jit);
-        // let x = run_iterative_fib_code(&mut jit, 10);
 
-        // println!("the answer is: {}", run_foo(&mut jit).unwrap());
+        println!("the answer is: {}", run_foo(&mut jit).unwrap());
         let a = A::new();
         run_ccc(&mut jit, &a).unwrap();
         // println!(
         //     "recursive_fib(10) = {}",
         //     run_recursive_fib_code(&mut jit, 10)?
         // );
-        // println!(
-        //     "iterative_fib(10) = {}",
-        //     run_iterative_fib_code(&mut jit, 10).unwrap()
-        // );
+        println!(
+            "iterative_fib(10) = {}",
+            run_iterative_fib_code(&mut jit, 10).unwrap()
+        );
         // run_hello(&mut jit)?;
     }
 
@@ -107,6 +109,7 @@ fn run_iterative_fib_code(jit: &mut jit::JIT, input: isize) -> Result<isize, Str
         let code_fn = core::mem::transmute::<_, fn(I) -> O>(code_ptr);
         // And now we can call it!
         Ok(code_fn(input))
+        // Err("a".to_owned())
     }
 
     // A small test function.

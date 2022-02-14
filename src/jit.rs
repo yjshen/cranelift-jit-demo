@@ -1,4 +1,4 @@
-use crate::frontend::*;
+use crate::assembler::*;
 use cranelift::prelude::*;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{DataContext, Linkage, Module};
@@ -65,10 +65,6 @@ impl JIT {
 
         // Next, declare the function to jit. Functions must be declared
         // before they can be called, or defined.
-        //
-        // TODO: This may be an area where the API should be streamlined; should
-        // we have a version of `declare_function` that automatically declares
-        // the function?
         let id = self
             .module
             .declare_function(&name, Linkage::Export, &self.ctx.func.signature)
@@ -79,14 +75,8 @@ impl JIT {
         // cannot finish relocations until all functions to be called are
         // defined. For this toy demo for now, we'll just finalize the
         // function below.
-        self.module
-            .define_function(
-                id,
-                &mut self.ctx,
-                &mut codegen::binemit::NullTrapSink {},
-                &mut codegen::binemit::NullStackMapSink {},
-            )
-            .map_err(|e| e.to_string())?;
+        let x = self.module.define_function(id, &mut self.ctx);
+        let w = x.err();
 
         // Now that compilation is finished, we can clear out the context state.
         self.module.clear_context(&mut self.ctx);
@@ -118,7 +108,6 @@ impl JIT {
         self.data_ctx.clear();
         self.module.finalize_definitions();
         let buffer = self.module.get_finalized_data(id);
-        // TODO: Can we move the unsafe into cranelift?
         Ok(unsafe { slice::from_raw_parts(buffer.0, buffer.1) })
     }
 
@@ -127,7 +116,7 @@ impl JIT {
         &mut self,
         params: Vec<NameType>,
         the_return: Option<NameType>,
-        stmts: Vec<Stmt>,
+        stmts: Vec<StmtCode>,
     ) -> Result<(), String> {
         // Our toy language currently only supports I64 values, though Cranelift
         // supports other types.
@@ -167,14 +156,14 @@ impl JIT {
         // Tell the builder to emit code in this block.
         builder.switch_to_block(entry_block);
 
-        // Walk the AST and declare all implicitly-declared variables.
-        let variables =
-            declare_variables(&type_table, &mut builder, &params, &the_return, &stmts, entry_block);
-
         // And, tell the builder that this block will have no further
         // predecessors. Since it's the entry block, it won't have any
         // predecessors.
         builder.seal_block(entry_block);
+
+        // Walk the AST and declare all implicitly-declared variables.
+        let variables =
+            declare_variables(&type_table, &mut builder, &params, &the_return, &stmts, entry_block);
 
         // Now translate the statements of the function body.
         let mut trans = FunctionTranslator {
@@ -217,79 +206,79 @@ struct FunctionTranslator<'a> {
 
 impl<'a> FunctionTranslator<'a> {
 
-    fn translate_stmt(&mut self, stmt: Stmt) {
+    fn translate_stmt(&mut self, stmt: StmtCode) {
         match stmt {
-            Stmt::IfElse(condition, then_body, else_body) => {
+            StmtCode::IfElse(condition, then_body, else_body) => {
                 self.translate_if_else(*condition, then_body, else_body)
             }
-            Stmt::WhileLoop(condition, loop_body) => {
+            StmtCode::WhileLoop(condition, loop_body) => {
                 self.translate_while_loop(*condition, loop_body)
             }
-            Stmt::Assign(name, expr) => {
+            StmtCode::Assign(name, expr) => {
                 self.translate_assign(name, *expr)
             }
-            Stmt::Initialization(nt, expr) => {
+            StmtCode::Initialization(nt, expr) => {
                 self.translate_assign(nt.name, *expr)
             }
-            Stmt::SideEffect(expr) => {
+            StmtCode::SideEffect(expr) => {
                 self.translate_expr(*expr);
             }
-            Stmt::Declare(_) => {}
+            StmtCode::Declare(_) => {}
         }
     }
 
     /// When you write out instructions in Cranelift, you get back `Value`s. You
     /// can then use these references in other instructions.
-    fn translate_expr(&mut self, expr: Expr) -> Value {
+    fn translate_expr(&mut self, expr: ExprCode) -> Value {
         match expr {
-            Expr::Literal(literal) => {
+            ExprCode::Literal(literal) => {
                 let imm: i32 = literal.parse().unwrap();
                 self.builder.ins().iconst(self.int, i64::from(imm))
             }
 
-            Expr::Identifier(name) => {
+            ExprCode::Identifier(name) => {
                 // `use_var` is used to read the value of a variable.
                 let variable = self.variables.get(&name).expect("variable not defined");
                 self.builder.use_var(*variable)
             }
 
-            Expr::Eq(lhs, rhs) => self.translate_icmp(IntCC::Equal, *lhs, *rhs),
-            Expr::Ne(lhs, rhs) => self.translate_icmp(IntCC::NotEqual, *lhs, *rhs),
-            Expr::Lt(lhs, rhs) => self.translate_icmp(IntCC::SignedLessThan, *lhs, *rhs),
-            Expr::Le(lhs, rhs) => self.translate_icmp(IntCC::SignedLessThanOrEqual, *lhs, *rhs),
-            Expr::Gt(lhs, rhs) => self.translate_icmp(IntCC::SignedGreaterThan, *lhs, *rhs),
-            Expr::Ge(lhs, rhs) => self.translate_icmp(IntCC::SignedGreaterThanOrEqual, *lhs, *rhs),
+            ExprCode::Eq(lhs, rhs) => self.translate_icmp(IntCC::Equal, *lhs, *rhs),
+            ExprCode::Ne(lhs, rhs) => self.translate_icmp(IntCC::NotEqual, *lhs, *rhs),
+            ExprCode::Lt(lhs, rhs) => self.translate_icmp(IntCC::SignedLessThan, *lhs, *rhs),
+            ExprCode::Le(lhs, rhs) => self.translate_icmp(IntCC::SignedLessThanOrEqual, *lhs, *rhs),
+            ExprCode::Gt(lhs, rhs) => self.translate_icmp(IntCC::SignedGreaterThan, *lhs, *rhs),
+            ExprCode::Ge(lhs, rhs) => self.translate_icmp(IntCC::SignedGreaterThanOrEqual, *lhs, *rhs),
 
-            Expr::Add(lhs, rhs) => {
+            ExprCode::Add(lhs, rhs) => {
                 let lhs = self.translate_expr(*lhs);
                 let rhs = self.translate_expr(*rhs);
                 self.builder.ins().iadd(lhs, rhs)
             }
 
-            Expr::Sub(lhs, rhs) => {
+            ExprCode::Sub(lhs, rhs) => {
                 let lhs = self.translate_expr(*lhs);
                 let rhs = self.translate_expr(*rhs);
                 self.builder.ins().isub(lhs, rhs)
             }
 
-            Expr::Mul(lhs, rhs) => {
+            ExprCode::Mul(lhs, rhs) => {
                 let lhs = self.translate_expr(*lhs);
                 let rhs = self.translate_expr(*rhs);
                 self.builder.ins().imul(lhs, rhs)
             }
 
-            Expr::Div(lhs, rhs) => {
+            ExprCode::Div(lhs, rhs) => {
                 let lhs = self.translate_expr(*lhs);
                 let rhs = self.translate_expr(*rhs);
                 self.builder.ins().udiv(lhs, rhs)
             }
 
-            Expr::Call(name, args) => self.translate_call(name, args),
-            Expr::GlobalDataAddr(name) => self.translate_global_data_addr(name),
+            ExprCode::Call(name, args) => self.translate_call(name, args),
+            ExprCode::GlobalDataAddr(name) => self.translate_global_data_addr(name),
         }
     }
 
-    fn translate_assign(&mut self, name: String, expr: Expr) {
+    fn translate_assign(&mut self, name: String, expr: ExprCode) {
         // `def_var` is used to write the value of a variable. Note that
         // variables can have multiple definitions. Cranelift will
         // convert them into SSA form for itself automatically.
@@ -298,7 +287,7 @@ impl<'a> FunctionTranslator<'a> {
         self.builder.def_var(*variable, new_value);
     }
 
-    fn translate_icmp(&mut self, cmp: IntCC, lhs: Expr, rhs: Expr) -> Value {
+    fn translate_icmp(&mut self, cmp: IntCC, lhs: ExprCode, rhs: ExprCode) -> Value {
         let lhs = self.translate_expr(lhs);
         let rhs = self.translate_expr(rhs);
         let c = self.builder.ins().icmp(cmp, lhs, rhs);
@@ -307,9 +296,9 @@ impl<'a> FunctionTranslator<'a> {
 
     fn translate_if_else(
         &mut self,
-        condition: Expr,
-        then_body: Vec<Stmt>,
-        else_body: Vec<Stmt>,
+        condition: ExprCode,
+        then_body: Vec<StmtCode>,
+        else_body: Vec<StmtCode>,
     ) {
         let condition_value = self.translate_expr(condition);
 
@@ -322,7 +311,7 @@ impl<'a> FunctionTranslator<'a> {
         // the then and else bodies. Cranelift uses block parameters,
         // so set up a parameter in the merge block, and we'll pass
         // the return values to it from the branches.
-        self.builder.append_block_param(merge_block, self.int);
+        // self.builder.append_block_param(merge_block, self.int);
 
         // Test the if condition and conditionally branch.
         self.builder.ins().brz(condition_value, else_block, &[]);
@@ -355,10 +344,10 @@ impl<'a> FunctionTranslator<'a> {
 
         // Read the value of the if-else by reading the merge block
         // parameter.
-        self.builder.block_params(merge_block)[0];
+        // self.builder.block_params(merge_block)[0];
     }
 
-    fn translate_while_loop(&mut self, condition: Expr, loop_body: Vec<Stmt>) {
+    fn translate_while_loop(&mut self, condition: ExprCode, loop_body: Vec<StmtCode>) {
         let header_block = self.builder.create_block();
         let body_block = self.builder.create_block();
         let exit_block = self.builder.create_block();
@@ -386,7 +375,7 @@ impl<'a> FunctionTranslator<'a> {
         self.builder.seal_block(exit_block);
     }
 
-    fn translate_call(&mut self, name: String, args: Vec<Expr>) -> Value {
+    fn translate_call(&mut self, name: String, args: Vec<ExprCode>) -> Value {
         let mut sig = self.module.make_signature();
 
         // Add a parameter for each argument.
@@ -397,7 +386,6 @@ impl<'a> FunctionTranslator<'a> {
         // For simplicity for now, just make all calls return a single I64.
         sig.returns.push(AbiParam::new(self.int));
 
-        // TODO: Streamline the API here?
         let callee = self
             .module
             .declare_function(&name, Linkage::Import, &sig)
@@ -433,7 +421,7 @@ fn declare_variables(
     builder: &mut FunctionBuilder,
     params: &[NameType],
     the_return: &Option<NameType>,
-    stmts: &[Stmt],
+    stmts: &[StmtCode],
     entry_block: Block,
 ) -> HashMap<String, Variable> {
     let mut variables = HashMap::new();
@@ -469,10 +457,10 @@ fn declare_variables_in_stmt(
     builder: &mut FunctionBuilder,
     variables: &mut HashMap<String, Variable>,
     index: &mut usize,
-    stmt: &Stmt,
+    stmt: &StmtCode,
 ) {
     match *stmt {
-        Stmt::IfElse(_, ref then_body, ref else_body) => {
+        StmtCode::IfElse(_, ref then_body, ref else_body) => {
             for stmt in then_body {
                 declare_variables_in_stmt(type_table, builder, variables, index, stmt);
             }
@@ -480,15 +468,15 @@ fn declare_variables_in_stmt(
                 declare_variables_in_stmt(type_table, builder, variables, index, stmt);
             }
         }
-        Stmt::WhileLoop(_, ref loop_body) => {
+        StmtCode::WhileLoop(_, ref loop_body) => {
             for stmt in loop_body {
                 declare_variables_in_stmt(type_table, builder, variables, index, stmt);
             }
         }
-        Stmt::Declare(ref nt) => {
+        StmtCode::Declare(ref nt) => {
             declare_variable(type_table, builder, variables, index, &nt);
         }
-        Stmt::Initialization(ref nt, _) => {
+        StmtCode::Initialization(ref nt, _) => {
             declare_variable(type_table, builder, variables, index, &nt);
         }
         _ => (),
